@@ -568,8 +568,62 @@ class GatewayRunner:
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
+        # Specialist router singleton (Phase C).
+        # Instantiated at construction time; no-op when specialists.enabled is
+        # False (the default), so existing behaviour is completely unchanged.
+        self._specialist_router = self._init_specialist_router()
 
+    # ------------------------------------------------------------------
+    # Specialist router helpers (Phase C — T014-T017)
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def _init_specialist_router():
+        """Instantiate the specialist :class:`~hermes.specialists.router.Router`.
+
+        Reads ``specialists`` config from ``~/.hermes/config.yaml`` and
+        creates a :class:`~hermes.specialists.config.RouterConfig` from it.
+        Always returns a Router instance; the feature flag inside RouterConfig
+        controls whether routing actually intercepts any messages.
+        """
+        try:
+            from hermes.specialists.config import RouterConfig
+            from hermes.specialists.router import Router
+            from hermes.specialists.trading import TradingSpecialist
+            from hermes.specialists.finance import FinanceSpecialist
+
+            cfg_dict: dict = {}
+            try:
+                import yaml as _yaml
+                cfg_path = _hermes_home / "config.yaml"
+                if cfg_path.exists():
+                    with open(cfg_path, encoding="utf-8") as _f:
+                        cfg_dict = _yaml.safe_load(_f) or {}
+            except Exception:
+                pass
+
+            router_config = RouterConfig.from_config_dict(cfg_dict)
+            specialists = [TradingSpecialist(), FinanceSpecialist()]
+            return Router(specialists, config=router_config)
+        except Exception as exc:
+            logger.debug("Specialist router init failed (non-fatal): %s", exc)
+            return None
+
+    @staticmethod
+    def _specialist_indicator_text(domain: str) -> str:
+        """Return a typing-indicator message for *domain*.
+
+        Args:
+            domain: Specialist name (``"trading"`` or ``"finance"``).
+
+        Returns:
+            A human-readable indicator string.
+        """
+        _indicators = {
+            "trading": "🔍 Consulting trading context...",
+            "finance": "🔍 Consulting finance context...",
+        }
+        return _indicators.get(domain, "🔍 Consulting specialist...")
 
     # -- Setup skill availability ----------------------------------------
 
@@ -2899,6 +2953,57 @@ class GatewayRunner:
                         message_text = _ctx_result.message
                 except Exception as exc:
                     logger.debug("@ context reference expansion failed: %s", exc)
+
+            # ----------------------------------------------------------
+            # Specialist router intercept (Phase C — T015 / T017)
+            #
+            # Check whether the specialist router can handle this message
+            # *before* spinning up a full agent turn.  The router is a
+            # no-op when specialists.enabled is False (the default), so
+            # this block has zero behavioural impact in that case.
+            # ----------------------------------------------------------
+            _specialist_result: Optional[str] = None
+            if self._specialist_router is not None:
+                try:
+                    _sid = session_entry.session_id
+                    _context_turns = len(history) // 2  # rough turn count
+
+                    # T017: if a prior turn was handled by a specialist,
+                    # route the follow-up directly to that specialist.
+                    if self._specialist_router.has_pending_followup(_sid):
+                        _ctx = self._specialist_router.get_session_context(_sid)
+                        _specialist_result = self._specialist_router.handle_followup(
+                            message_text, _ctx
+                        )
+                    else:
+                        # T015: attempt to route to a specialist first.
+                        _specialist_result = self._specialist_router.route(
+                            message_text, _sid, _context_turns
+                        )
+
+                    if _specialist_result is not None:
+                        # T016: send a typing indicator with domain name.
+                        _domain = self._specialist_router.get_session_context(_sid).get(
+                            "specialist", ""
+                        )
+                        _indicator = self._specialist_indicator_text(_domain)
+                        _spec_adapter = self.adapters.get(source.platform)
+                        if _spec_adapter:
+                            try:
+                                await _spec_adapter.send(
+                                    source.chat_id,
+                                    _indicator,
+                                    metadata=getattr(event, "metadata", None),
+                                )
+                            except Exception:
+                                pass
+                        return _specialist_result
+                except Exception as _spec_exc:
+                    logger.debug(
+                        "Specialist router raised an exception (non-fatal): %s",
+                        _spec_exc,
+                    )
+                    _specialist_result = None
 
             # Run the agent
             agent_result = await self._run_agent(
